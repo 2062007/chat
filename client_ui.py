@@ -1,13 +1,14 @@
-import random, time, requests
+import requests
 from datetime import datetime
 import socketio
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.align import Align
 
 console = Console()
 
-# ==== Danh sách 5 VPS của ông (đổi URL thực tế) ====
+# ==== Danh sách 5 VPS ====
 SERVERS = [
     "https://chat-vps1.onrender.com",
     "https://chat-vps2.onrender.com",
@@ -16,81 +17,102 @@ SERVERS = [
     "https://chat-vps5.onrender.com"
 ]
 
-def pick_server(last=None):
-    choices = [s for s in SERVERS if s != last] or SERVERS[:]
-    return random.choice(choices)
+COLORS = ["cyan", "magenta", "green", "yellow", "blue", "red"]
+user_colors = {}
 
-def load_history(base_url):
+def get_color(user: str):
+    if user not in user_colors:
+        user_colors[user] = COLORS[len(user_colors) % len(COLORS)]
+    return user_colors[user]
+
+def show_message(user, msg, ts=None, me=False):
+    ts = ts or datetime.now().strftime("%H:%M:%S")
+    color = get_color(user)
+
+    header = f"[dim]{ts}[/] [bold {color}]{user}[/]"
+    bubble = Panel(
+        msg,
+        title=header if not me else None,
+        subtitle=header if me else None,
+        subtitle_align="right" if me else "left",
+        border_style=color,
+        expand=False,
+        padding=(0, 2),
+        highlight=True,
+    )
+
+    if me:
+        console.print(Align.right(bubble))
+    else:
+        console.print(Align.left(bubble))
+
+def load_history(base_url, username):
     try:
-        r = requests.get(f"{base_url}/history?limit=50", timeout=6)
+        r = requests.get(f"{base_url}/history?limit=15", timeout=6)
         if r.ok:
             msgs = r.json()
             if msgs:
-                console.print(Panel("[bold cyan]📜 50 tin nhắn gần nhất[/]"))
+                console.print(Panel(f"[bold cyan]📜 15 tin gần nhất từ {base_url}[/]", border_style="bright_black"))
                 for it in msgs:
-                    console.print(f"[cyan]{it['time']}[/] 💬 [bold yellow]{it['user']}[/]: {it['msg']}")
+                    show_message(it["user"], it["msg"], it["time"], me=(it["user"] == username))
     except Exception as e:
-        console.print(f"[red]⚠️ Không load được history: {e}[/]")
+        console.print(f"[red]⚠️ Lỗi load history {base_url}: {e}[/]")
 
-def connect_with_failover(sio, username):
-    tried = set()
-    url = pick_server()
-    while True:
-        console.clear()
-        console.print(Panel(f"[bold green]🔗 Đang kết nối tới {url}[/]", title="Chat Client"))
-        try:
-            # Ép WebSocket + gửi Origin để né 401 CORS
-            sio.connect(url, transports=["websocket"], headers={"Origin": url})
-            console.print("[bold green]✅ Đã kết nối tới server![/]")
-            load_history(url)
-            return url
-        except Exception as e:
-            console.print(f"[bold red]Không thể kết nối: {e}[/]")
-            tried.add(url)
-            if len(tried) >= len(SERVERS):
-                console.print("[yellow]🌀 Thử lại từ đầu sau 2s...[/]")
-                tried.clear()
-                time.sleep(2)
-            url = pick_server(last=url)
-
-def main():
-    sio = socketio.Client(reconnection=True, reconnection_attempts=0)  # auto reconnect vô hạn
-    username = Prompt.ask("👤 Nhập tên của bạn").strip() or "guest"
+def connect_server(base_url, username):
+    sio = socketio.Client(reconnection=True, reconnection_attempts=0)
 
     @sio.event
     def connect():
-        # đã in ở connect_with_failover
-        pass
+        console.print(Panel(f"[green]✅ Kết nối {base_url}[/]", border_style="green"))
+        load_history(base_url, username)
 
     @sio.event
     def disconnect():
-        console.print("[bold red]❌ Mất kết nối! Đang thử kết nối lại...[/]")
+        console.print(f"[red]❌ Mất kết nối {base_url}, thử reconnect...[/]")
 
     @sio.on("message")
     def on_message(data):
-        # data = {"user","msg","time"}
         try:
-            ts = data.get("time") or datetime.now().strftime("%H:%M:%S")
-            console.print(f"[cyan]{ts}[/] 💬 [bold yellow]{data.get('user','?')}[/]: {data.get('msg','')}")
+            show_message(data.get("user", "?"), data.get("msg", ""), data.get("time"), me=(data.get("user") == username))
         except Exception:
-            console.print(f"[cyan]{datetime.now().strftime('%H:%M:%S')}[/] 💬 {data}")
+            console.print(f"[dim]{datetime.now().strftime('%H:%M:%S')}[/] 💬 {data}")
 
-    # Kết nối + failover
-    connect_with_failover(sio, username)
+    try:
+        sio.connect(base_url, transports=["websocket"], headers={"Origin": base_url})
+    except Exception as e:
+        console.print(f"[red]⚠️ Không connect {base_url}: {e}[/]")
+
+    return sio
+
+def main():
+    username = Prompt.ask("👤 Nhập tên của bạn").strip() or "guest"
+    clients = []
+
+    # Kết nối tất cả server
+    for url in SERVERS:
+        sio = connect_server(url, username)
+        clients.append(sio)
+
+    console.print(Panel("[bold cyan]✨ Bắt đầu chat nào! Ctrl+C để thoát ✨[/]", border_style="cyan"))
 
     # Vòng lặp chat
     while True:
         try:
-            text = Prompt.ask(f"[bold blue]{username}[/]").strip()
+            text = Prompt.ask(f"[bold]{username}[/]").strip()
             if text:
-                sio.send({"user": username, "msg": text})
+                for sio in clients:
+                    if sio.connected:
+                        sio.send({"user": username, "msg": text})
+                # In luôn tin nhắn của mình dạng bong bóng bên phải
+                show_message(username, text, me=True)
         except KeyboardInterrupt:
             console.print("\n[red]👋 Thoát chat[/]")
-            try:
-                sio.disconnect()
-            finally:
-                break
+            for sio in clients:
+                try:
+                    sio.disconnect()
+                except:
+                    pass
+            break
 
 if __name__ == "__main__":
     main()
-
