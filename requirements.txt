@@ -1,0 +1,6 @@
+flask
+flask-socketio
+eventlet
+redis
+python-socketio[client]
+rich
